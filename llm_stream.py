@@ -279,7 +279,10 @@ def _build_request(provider: str, model: str, messages: list[dict],
         ep = (cfg.get("local_endpoint") or "").rstrip("/")
         if not ep: raise LLMStreamError(provider, "No local endpoint configured (set local_endpoint)")
         headers = {"Content-Type": "application/json"}
-        key = cfg.get("api_key") or cfg.get("llm_api_key", "")
+        # The local server has its own key (llama.cpp --api-key); `api_key` in the shared config is
+        # the Azure Foundry key and must never be sent to the LAN server (it 401'd gnome-speaks AI
+        # mode on wakizashi/katana, 2026-10-27). Precedence: local_api_key > llm_api_key > nothing.
+        key = cfg.get("local_api_key") or cfg.get("llm_api_key", "")
         if key: headers["Authorization"] = f"Bearer {key}"
         body = {"model": model, "messages": _openai_msgs(sp, msgs), "max_tokens": mt, "stream": True}
         extra = cfg.get("local_extra_body")
