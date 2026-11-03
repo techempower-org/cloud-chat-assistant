@@ -478,12 +478,28 @@ def _aws_sign(method, url, headers, payload, region, service="bedrock"):
 FOUNDRY_CLAUDE_MODEL = "claude-opus-5-5"
 
 
+FOUNDRY_HOST_SUFFIX = ".services.ai.azure.com"
+_FOUNDRY_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _is_claude(name):
+    """Every Claude/Anthropic model name: routed to Foundry, whatever its model_type."""
+    n = (name or "").lower()
+    return "claude" in n or "anthropic" in n
+
+
 def _foundry_claude_endpoint():
+    """The Anthropic route URL, or "" unless it is https on a *.services.ai.azure.com
+    host with no userinfo, query or fragment (the shared Azure key is sent there)."""
     ep = CONFIG.get("foundry_anthropic_endpoint", "")
     if not ep:
         base = CONFIG.get("endpoint", "")
-        if ".services.ai.azure.com" in base:
-            ep = base.rstrip("/") + "/anthropic"
+        ep = base.rstrip("/") + "/anthropic" if base else ""
+    u = urlparse(ep)
+    host = (u.hostname or "").lower()
+    if (u.scheme != "https" or not host.endswith(FOUNDRY_HOST_SUFFIX) or host == FOUNDRY_HOST_SUFFIX[1:]
+            or u.username or u.password or u.query or u.fragment or (u.port not in (None, 443))):
+        return ""
     return ep.rstrip("/")
 
 
@@ -499,44 +515,62 @@ async def call_foundry_claude(client: httpx.AsyncClient, messages, progress_toke
     """Claude Opus 5.5 on Foundry. Returns (response_text, usage_dict, latency_ms).
 
     Opus 5.5: thinking is always on and counts toward max_tokens, so the
-    ceiling gets headroom; effort is explicit; no temperature, no prefill."""
-    if not _foundry_claude_configured():
-        return "Error: Foundry Claude not configured (endpoint on *.services.ai.azure.com + api_key).", {}, 0
-    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
-    msgs = [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] in ("user", "assistant")]
-    if not msgs or msgs[-1]["role"] != "user":
-        return "Error: conversation must end with a user turn.", {}, 0
-    body = {
-        "model": FOUNDRY_CLAUDE_MODEL,
-        "max_tokens": max(int(CONFIG.get("max_completion_tokens", 2048)), 4096) + 12000,
-        "output_config": {"effort": CONFIG.get("foundry_claude_effort", "medium")},
-        "messages": msgs,
-    }
-    if system:
-        body["system"] = system
-    headers = {"x-api-key": _foundry_claude_key(), "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    label = model_name if model_name == FOUNDRY_CLAUDE_MODEL else f"{model_name} → {FOUNDRY_CLAUDE_MODEL}"
-    if progress_token:
-        await _send_progress(progress_token, 0.1, f"[{label}] Thinking...")
-    t0 = time.perf_counter()
+    ceiling gets headroom; effort is explicit; no temperature, no prefill.
+    Claude never falls back to Bedrock: a missing Foundry config is an error."""
+    def fail(msg, status="Error"):
+        _model_status[model_name] = status
+        return msg, {}, 0
     try:
-        resp = await client.post(_foundry_claude_endpoint() + "/v1/messages", json=body, headers=headers,
+        if not _is_claude(model_name):
+            return fail(f"Error: '{model_name}' is not a Claude model; the foundry route serves Claude only.")
+        endpoint, key = _foundry_claude_endpoint(), _foundry_claude_key()
+        if not endpoint or not key:
+            return fail("Error: Foundry Claude not configured: set an https *.services.ai.azure.com endpoint "
+                        "(or foundry_anthropic_endpoint) and api_key (or foundry_anthropic_api_key).", "Not configured")
+        effort = CONFIG.get("foundry_claude_effort", "medium")
+        if effort not in _FOUNDRY_EFFORTS:
+            return fail(f"Error: foundry_claude_effort must be one of {', '.join(_FOUNDRY_EFFORTS)}.")
+        try:
+            reply_budget = max(int(CONFIG.get("max_completion_tokens", 2048)), 4096)
+        except (TypeError, ValueError):
+            return fail("Error: max_completion_tokens must be an integer.")
+        system = "\n\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "system")
+        msgs = [{"role": m["role"], "content": m["content"]} for m in messages if m.get("role") in ("user", "assistant")]
+        if not msgs or msgs[-1]["role"] != "user":
+            return fail("Error: conversation must end with a user turn.")
+        body = {
+            "model": FOUNDRY_CLAUDE_MODEL,
+            "max_tokens": min(reply_budget + 12000, 64000),
+            "output_config": {"effort": effort},
+            "messages": msgs,
+        }
+        if system:
+            body["system"] = system
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        label = model_name if model_name == FOUNDRY_CLAUDE_MODEL else f"{model_name} → {FOUNDRY_CLAUDE_MODEL}"
+        if progress_token:
+            await _send_progress(progress_token, 0.1, f"[{label}] Thinking...")
+        t0 = time.perf_counter()
+        resp = await client.post(endpoint + "/v1/messages", json=body, headers=headers,
                                  timeout=180.0, follow_redirects=False)
         latency = (time.perf_counter() - t0) * 1000
         if resp.status_code != 200:
-            _model_status[model_name] = f"Error {resp.status_code}"
-            return f"Error {resp.status_code} from Foundry Claude (request {resp.headers.get('request-id', '?')})", {}, 0
+            return fail(f"Error {resp.status_code} from Foundry Claude (request {resp.headers.get('request-id', '?')})",
+                        f"Error {resp.status_code}")
         data = resp.json()
         if data.get("stop_reason") == "refusal":
+            _model_status[model_name] = "Refused"
             cat = (data.get("stop_details") or {}).get("category")
             return f"**[{label}]** declined the request (refusal, category {cat}).", data.get("usage", {}), latency
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         if data.get("stop_reason") == "max_tokens":
+            _model_status[model_name] = "Truncated"
             text += "\n\n[truncated at max_tokens]"
-        _model_status[model_name] = "OK"
+        else:
+            _model_status[model_name] = "OK"
         return text, data.get("usage", {}), latency
     except Exception as e:
-        return f"Error: {type(e).__name__}", {}, 0
+        return fail(f"Error: {type(e).__name__} calling Foundry Claude")
 
 
 async def call_bedrock(client: httpx.AsyncClient, messages, progress_token=None, model_name="claude-opus-4.5"):
@@ -816,7 +850,7 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
         model_type = "codex"
 
     # Claude runs on Azure Foundry's Anthropic route (claude-opus-5-5), never Bedrock
-    if model_type == "foundry" or (model_type == "bedrock" and "claude" in deployment.lower() and _foundry_claude_configured()):
+    if model_type == "foundry" or _is_claude(deployment):
         return await call_foundry_claude(client, messages, progress_token, deployment)
 
     # Route to Bedrock if model type is bedrock (use deployment for model name)
@@ -1215,7 +1249,7 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
             return "puter"
         if "gemini" in ml:
             return "google"
-        if ("claude" in ml or "anthropic" in ml) and _foundry_claude_configured():
+        if _is_claude(model_name):
             return "foundry"
         if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml or "palmyra" in ml:
             return "bedrock"
