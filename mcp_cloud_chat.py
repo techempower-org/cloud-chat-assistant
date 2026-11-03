@@ -54,14 +54,14 @@ DEFAULTS = {
     "endpoint": "",
     "deployment": "gpt-5.3-chat",
     "model": "gpt-5.3-chat-2026-03-03",
-    "model_type": "deployed",       # "deployed", "serverless", "codex", "bedrock", "google", "digitalocean", "puter"
+    "model_type": "deployed",       # "deployed", "serverless", "codex", "bedrock", "foundry", "google", "digitalocean", "puter"
     "reasoning_effort": "medium",    # for codex/reasoning models: low, medium, high, xhigh
     "max_completion_tokens": 2048,
     "temperature": 1.0,
     "system_prompt": "You are a helpful chat assistant. Keep responses concise and conversational.",
     "conversation_max_turns": 50,    # max history turns before auto-trimming
     "voice": "",                     # default TTS voice (empty = use speech config)
-    "default_models": ["gpt-5.3-chat", "o4-mini", "grok-3", "DeepSeek-R1", "claude-sonnet-4.6", "gemini-3.1-pro-preview"],  # models for multi_chat when none specified
+    "default_models": ["gpt-5.3-chat", "o4-mini", "grok-3", "DeepSeek-R1", "claude-opus-5-5", "gemini-3.1-pro-preview"],  # models for multi_chat when none specified
     "multi_chat_timeout": 15,        # per-model timeout in seconds for multi_chat
     "google_api_key": "",
     "google_project": "",
@@ -469,6 +469,114 @@ def _aws_sign(method, url, headers, payload, region, service="bedrock"):
     return {**headers, **signed}
 
 
+# ── Claude on Azure AI Foundry (Anthropic Messages route) ─────────────────
+# JP 2026-11-01: "opus only", "we should be using azure foundry for opus not
+# bedrock". Every Claude name is served as claude-opus-5-5 on the Foundry
+# resource's /anthropic route; the key is foundry_anthropic_api_key, else the
+# shared Azure api_key (same resource).
+
+FOUNDRY_CLAUDE_MODEL = "claude-opus-5-5"
+
+
+FOUNDRY_HOST_SUFFIX = ".services.ai.azure.com"
+_FOUNDRY_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _is_claude(name):
+    """Every Claude/Anthropic model name: routed to Foundry, whatever its model_type."""
+    n = (name or "").lower()
+    return "claude" in n or "anthropic" in n
+
+
+def _foundry_claude_endpoint():
+    """The Anthropic route URL, or "" unless it is https on a *.services.ai.azure.com
+    host with no userinfo, query or fragment (the shared Azure key is sent there)."""
+    ep = CONFIG.get("foundry_anthropic_endpoint", "")
+    if not ep:
+        base = CONFIG.get("endpoint", "")
+        ep = base.rstrip("/") + "/anthropic" if base else ""
+    u = urlparse(ep)
+    host = (u.hostname or "").lower()
+    if (u.scheme != "https" or not host.endswith(FOUNDRY_HOST_SUFFIX) or host == FOUNDRY_HOST_SUFFIX[1:]
+            or u.username or u.password or u.query or u.fragment or (u.port not in (None, 443))):
+        return ""
+    return ep.rstrip("/")
+
+
+def _foundry_claude_key():
+    return CONFIG.get("foundry_anthropic_api_key") or CONFIG.get("api_key", "")
+
+
+def _foundry_claude_configured():
+    return bool(_foundry_claude_endpoint() and _foundry_claude_key())
+
+
+async def call_foundry_claude(client: httpx.AsyncClient, messages, progress_token=None, model_name=FOUNDRY_CLAUDE_MODEL):
+    """Claude Opus 5.5 on Foundry. Returns (response_text, usage_dict, latency_ms).
+
+    Opus 5.5: thinking is always on and counts toward max_tokens, so the
+    ceiling gets headroom; effort is explicit; no temperature, no prefill.
+    Claude never falls back to Bedrock: a missing Foundry config is an error."""
+    def fail(msg, status="Error", latency=0):
+        _model_status[model_name] = status
+        return msg, {}, latency
+    try:
+        if not _is_claude(model_name):
+            return fail(f"Error: '{model_name}' is not a Claude model; the foundry route serves Claude only.")
+        endpoint, key = _foundry_claude_endpoint(), _foundry_claude_key()
+        if not endpoint or not key:
+            return fail("Error: Foundry Claude not configured: set an https *.services.ai.azure.com endpoint "
+                        "(or foundry_anthropic_endpoint) and api_key (or foundry_anthropic_api_key).", "Not configured")
+        effort = CONFIG.get("foundry_claude_effort", "medium")
+        if effort not in _FOUNDRY_EFFORTS:
+            return fail(f"Error: foundry_claude_effort must be one of {', '.join(_FOUNDRY_EFFORTS)}.")
+        try:
+            reply_budget = max(int(CONFIG.get("max_completion_tokens", 2048)), 4096)
+        except (TypeError, ValueError):
+            return fail("Error: max_completion_tokens must be an integer.")
+        system = "\n\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "system")
+        msgs = [{"role": m["role"], "content": m["content"]} for m in messages if m.get("role") in ("user", "assistant")]
+        if not msgs or msgs[-1]["role"] != "user":
+            return fail("Error: conversation must end with a user turn.")
+        body = {
+            "model": FOUNDRY_CLAUDE_MODEL,
+            "max_tokens": min(reply_budget + 12000, 64000),
+            "output_config": {"effort": effort},
+            "messages": msgs,
+        }
+        if system:
+            body["system"] = system
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        label = model_name if model_name == FOUNDRY_CLAUDE_MODEL else f"{model_name} → {FOUNDRY_CLAUDE_MODEL}"
+        if progress_token:
+            await _send_progress(progress_token, 0.1, f"[{label}] Thinking...")
+        t0 = time.perf_counter()
+        resp = await client.post(endpoint + "/v1/messages", json=body, headers=headers,
+                                 timeout=180.0, follow_redirects=False)
+        latency = (time.perf_counter() - t0) * 1000
+        if resp.status_code == 429:  # same marker as the other providers, so chat() can fall back
+            return fail(f"**[{model_name}]** is currently resting (Rate Limit hit).", "Rate Limited", latency)
+        if resp.status_code != 200:
+            return fail(f"Error {resp.status_code} from Foundry Claude (request {resp.headers.get('request-id', '?')})",
+                        f"Error {resp.status_code}", latency)
+        data = resp.json()
+        if data.get("stop_reason") == "refusal":
+            _model_status[model_name] = "Refused"
+            cat = (data.get("stop_details") or {}).get("category")
+            return f"**[{label}]** declined the request (refusal, category {cat}).", data.get("usage", {}), latency
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        if data.get("stop_reason") == "max_tokens":
+            _model_status[model_name] = "Truncated"
+            text += "\n\n[truncated at max_tokens]"
+        elif not text.strip():
+            return fail("Error: No response from model.", "Empty", latency)
+        else:
+            _model_status[model_name] = "OK"
+        return text, data.get("usage", {}), latency
+    except Exception as e:
+        return fail(f"Error: {type(e).__name__} calling Foundry Claude")
+
+
 async def call_bedrock(client: httpx.AsyncClient, messages, progress_token=None, model_name="claude-opus-4.5"):
     """Call AWS Bedrock using the Converse API. Returns (response_text, usage_dict, latency_ms)."""
     region = CONFIG.get("aws_region", "us-east-1")
@@ -744,6 +852,10 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     _responses_api_models = ("codex", "deep-research", "gpt-5.4-pro", "gpt-5.4")
     if model_type == "deployed" and any(p in deployment.lower() for p in _responses_api_models):
         model_type = "codex"
+
+    # Claude runs on Azure Foundry's Anthropic route (claude-opus-5-5), never Bedrock
+    if model_type == "foundry" or _is_claude(deployment):
+        return await call_foundry_claude(client, messages, progress_token, deployment)
 
     # Route to Bedrock if model type is bedrock (use deployment for model name)
     if model_type == "bedrock":
@@ -1141,6 +1253,8 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
             return "puter"
         if "gemini" in ml:
             return "google"
+        if _is_claude(model_name):
+            return "foundry"
         if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml or "palmyra" in ml:
             return "bedrock"
         # Responses API models (codex, deep-research, pro reasoning)
@@ -1252,7 +1366,7 @@ TOOLS = [
                 "endpoint": {"type": "string"},
                 "deployment": {"type": "string"},
                 "model": {"type": "string"},
-                "model_type": {"type": "string", "enum": ["deployed", "serverless", "codex", "bedrock", "google", "digitalocean", "puter"]},
+                "model_type": {"type": "string", "enum": ["deployed", "serverless", "codex", "bedrock", "foundry", "google", "digitalocean", "puter"]},
                 "aws_access_key": {"type": "string", "description": "AWS Access Key ID for Bedrock."},
                 "aws_secret_key": {"type": "string", "description": "AWS Secret Access Key for Bedrock."},
                 "aws_region": {"type": "string", "description": "AWS region for Bedrock (default: us-east-1)."},
