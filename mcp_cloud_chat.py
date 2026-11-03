@@ -517,9 +517,9 @@ async def call_foundry_claude(client: httpx.AsyncClient, messages, progress_toke
     Opus 5.5: thinking is always on and counts toward max_tokens, so the
     ceiling gets headroom; effort is explicit; no temperature, no prefill.
     Claude never falls back to Bedrock: a missing Foundry config is an error."""
-    def fail(msg, status="Error"):
+    def fail(msg, status="Error", latency=0):
         _model_status[model_name] = status
-        return msg, {}, 0
+        return msg, {}, latency
     try:
         if not _is_claude(model_name):
             return fail(f"Error: '{model_name}' is not a Claude model; the foundry route serves Claude only.")
@@ -554,9 +554,11 @@ async def call_foundry_claude(client: httpx.AsyncClient, messages, progress_toke
         resp = await client.post(endpoint + "/v1/messages", json=body, headers=headers,
                                  timeout=180.0, follow_redirects=False)
         latency = (time.perf_counter() - t0) * 1000
+        if resp.status_code == 429:  # same marker as the other providers, so chat() can fall back
+            return fail(f"**[{model_name}]** is currently resting (Rate Limit hit).", "Rate Limited", latency)
         if resp.status_code != 200:
             return fail(f"Error {resp.status_code} from Foundry Claude (request {resp.headers.get('request-id', '?')})",
-                        f"Error {resp.status_code}")
+                        f"Error {resp.status_code}", latency)
         data = resp.json()
         if data.get("stop_reason") == "refusal":
             _model_status[model_name] = "Refused"
@@ -566,6 +568,8 @@ async def call_foundry_claude(client: httpx.AsyncClient, messages, progress_toke
         if data.get("stop_reason") == "max_tokens":
             _model_status[model_name] = "Truncated"
             text += "\n\n[truncated at max_tokens]"
+        elif not text.strip():
+            return fail("Error: No response from model.", "Empty", latency)
         else:
             _model_status[model_name] = "OK"
         return text, data.get("usage", {}), latency
